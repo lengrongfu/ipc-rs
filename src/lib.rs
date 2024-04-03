@@ -20,6 +20,7 @@ use libc::{
 	msqid_ds,
 };
 
+use std::fmt;
 use std::ptr;
 //use std::mem;
 use std::convert::From;
@@ -98,6 +99,12 @@ pub enum IpcError {
 	/// a value it should never return.
 	/// (for example `msgsnd()` returning 5)
 	UnknownReturnValue(i32),
+}
+
+impl fmt::Display for IpcError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{:?}", self)
+    }
 }
 
 
@@ -433,7 +440,7 @@ impl MessageQueue {
 impl MessageQueue {
 	/// Sends a new message, or tries to (in case of non-blocking calls).
 	/// If the queue is full, `IpcError::QueueFull` is returned
-	pub fn send<I>(&self, src: &str, mtype: I) -> Result<(), IpcError> where I: Into<i64> {
+	pub fn send<I>(&self, src: &[u8], mtype: I) -> Result<(), IpcError> where I: Into<i64> {
 		if !self.initialized {
 			return Err(IpcError::QueueIsUninitialized);
 		}
@@ -443,19 +450,17 @@ impl MessageQueue {
 			mtext: [0; 65536],
 		});
 
-		let bytes = src.as_bytes();
-
-		bytes
+		src
 			.iter()
 			.enumerate()
 			.for_each(|(i, x)| message.mtext[i] = *x);
 
-		for i in 0..bytes.len() {
-			message.mtext[i] = bytes[i];
+		for i in 0..src.len() {
+			message.mtext[i] = src[i];
 		}
 
 		let res = unsafe {
-			msgsnd(self.id, message.borrow() as *const Message, bytes.len(), 0)
+			msgsnd(self.id, message.borrow() as *const Message, src.len(), 0)
 		};
 
 		match res {
@@ -476,43 +481,10 @@ impl MessageQueue {
 		}
 	}
 
-	/// Returns a message without removing it from the message
-	/// queue. Use `recv_type()` if you want to consume the message
-	pub fn peek(&self) -> Result<String, IpcError> {
-		if !self.initialized {
-			return Err(IpcError::QueueIsUninitialized);
-		}
-
-		let mut message: Box<Message> = Box::new(Message {
-			mtype: 0,
-			mtext: [0; 65536],
-		});
-
-		let size = unsafe { msgrcv(self.id, message.borrow_mut() as *mut Message, 65536, 0, IpcFlags::MsgCopy as i32 | self.message_mask) };
-
-		if size >= 0 {
-			String::from_utf8(message.mtext[..size as usize].to_vec())
-				.map_err(|_| IpcError::FailedToDeserialize)
-		}
-		else {
-			match Errno::from_i32(errno()) {
-				Errno::EFAULT => Err(IpcError::CouldntReadMessage),
-				Errno::EIDRM  => Err(IpcError::QueueWasRemoved),
-				Errno::EINTR  => Err(IpcError::SignalReceived),
-				Errno::EINVAL => Err(IpcError::InvalidMessage),
-				Errno::E2BIG  => Err(IpcError::MessageTooBig),
-				Errno::EACCES => Err(IpcError::AccessDenied),
-				Errno::ENOMSG => Err(IpcError::NoMessage),
-				Errno::EAGAIN => Err(IpcError::QueueFull),
-				Errno::ENOMEM => Err(IpcError::NoMemory),
-				_ => Err(IpcError::UnknownErrorValue(errno())),
-			}
-		}
-	}
 
 	/// Returns a message of given type without removing it from the message
 	/// queue. Use `recv_type()` if you want to consume the message
-	pub fn peek_type<I>(&self, mtype: I) -> Result<String, IpcError> where I: Into<i64> {
+	fn receiver<I>(&self, mtype: I, flags: i32) -> Result<Vec<u8>, IpcError> where I: Into<i64> {
 		if !self.initialized {
 			return Err(IpcError::QueueIsUninitialized);
 		}
@@ -522,12 +494,12 @@ impl MessageQueue {
 			mtext: [0; 65536],
 		});
 
-		let size = unsafe { msgrcv(self.id, message.borrow_mut() as *mut Message, 65536, message.mtype, IpcFlags::MsgCopy as i32 | self.message_mask) };
+		let size = unsafe { msgrcv(self.id, message.borrow_mut() as *mut Message, 65536, message.mtype, flags | self.message_mask) };
 
 		if size >= 0 {
-			String::from_utf8(message.mtext[..size as usize].to_vec())
-				.map_err(|_| IpcError::FailedToDeserialize)
+			Ok(message.mtext.iter().cloned().take(size as usize).collect())
 		}
+
 		else {
 			match Errno::from_i32(errno()) {
 				Errno::EFAULT => Err(IpcError::CouldntReadMessage),
@@ -544,76 +516,62 @@ impl MessageQueue {
 		}
 	}
 
-	/// Receives a message, consuming it. If no message is
-	/// to be received, `recv()` either blocks or returns
+	/// Returns a message without removing it from the message
+	/// queue. Use `recv_type()` if you want to consume the message
+	pub fn peek(&self) -> Result<Vec<u8>, IpcError> {
+		self.receiver(0, IpcFlags::MsgCopy as i32)
+	}
+
+	/// Returns a message of a given type without removing it from the message
+	/// queue. Use `recv_type()` if you want to consume the message
+	pub fn peek_type<I>(&self, mtype: I) -> Result<Vec<u8>, IpcError> where I: Into<i64> {
+		self.receiver(mtype, IpcFlags::MsgCopy as i32)
+	}
+	
+	/// Returns a message without removing it from the message
+	/// queue. Use `recv_type()` if you want to consume the message
+	/// This is a non-blocking version of `peek()`
+	pub fn peek_nonblocking(&self) -> Result<Vec<u8>, IpcError> {
+		self.receiver(0, IpcFlags::NoWait as i32 | IpcFlags::MsgCopy as i32)
+	}
+
+	/// Returns a message of a given type without removing it from the message
+	/// queue. Use `recv_type()` if you want to consume the message
+	/// This is a non-blocking version of `peek_type()`
+	pub fn peek_type_nonblocking<I>(&self, mtype: I) -> Result<Vec<u8>, IpcError> where I: Into<i64> {
+		self.receiver(mtype, IpcFlags::NoWait as i32 | IpcFlags::MsgCopy as i32)
+	}
+
+	/// Receives a message of a type, consuming it. If no message is
+	/// to be received, `recv_type()` either blocks or returns
 	/// [`IpcError::NoMemory`]
-	pub fn recv(&self) -> Result<String, IpcError> {
-		if !self.initialized {
-			return Err(IpcError::QueueIsUninitialized);
-		}
-
-		let mut message: Box<Message> = Box::new(Message {
-			mtype: 0,
-			mtext: [0; 65536],
-		}); // spooky scary stuff
-
-		let size = unsafe { msgrcv(self.id, message.borrow_mut() as *mut Message, 65536, 0, self.message_mask) };
-
-		if size >= 0 {
-			String::from_utf8(message.mtext[..size as usize].to_vec())
-				.map_err(|_| IpcError::FailedToDeserialize)
-		}
-		else {
-			match Errno::from_i32(errno()) {
-				Errno::EFAULT => Err(IpcError::CouldntReadMessage),
-				Errno::EIDRM  => Err(IpcError::QueueWasRemoved),
-				Errno::EINTR  => Err(IpcError::SignalReceived),
-				Errno::EINVAL => Err(IpcError::InvalidMessage),
-				Errno::E2BIG  => Err(IpcError::MessageTooBig),
-				Errno::EACCES => Err(IpcError::AccessDenied),
-				Errno::ENOMSG => Err(IpcError::NoMessage),
-				Errno::EAGAIN => Err(IpcError::QueueFull),
-				Errno::ENOMEM => Err(IpcError::NoMemory),
-				_ => Err(IpcError::UnknownErrorValue(errno())),
-			}
-		}
+	pub fn recv(&self) -> Result<Vec<u8>, IpcError> {
+		self.receiver(0, 0)
 	}
 
-	/// Receives a message of a type, consuming it. 
+	/// Receives a message of a type, consuming it.
 	/// If no message is to be received, `recv_type()` either blocks or returns
-	/// either blocks or returns
 	/// [`IpcError::NoMemory`]
-	pub fn recv_type<I>(&self, mtype: I) -> Result<String, IpcError> where I: Into<i64> {
-		if !self.initialized {
-			return Err(IpcError::QueueIsUninitialized);
-		}
-
-		let mut message: Box<Message> = Box::new(Message {
-			mtype: mtype.into(),
-			mtext: [0; 65536],
-		}); // spooky scary stuff
-
-		let size = unsafe { msgrcv(self.id, message.borrow_mut() as *mut Message, 65536, message.mtype, self.message_mask) };
-
-		if size >= 0 {
-			String::from_utf8(message.mtext[..size as usize].to_vec())
-				.map_err(|_| IpcError::FailedToDeserialize)
-		}
-		else {
-			match Errno::from_i32(errno()) {
-				Errno::EFAULT => Err(IpcError::CouldntReadMessage),
-				Errno::EIDRM  => Err(IpcError::QueueWasRemoved),
-				Errno::EINTR  => Err(IpcError::SignalReceived),
-				Errno::EINVAL => Err(IpcError::InvalidMessage),
-				Errno::E2BIG  => Err(IpcError::MessageTooBig),
-				Errno::EACCES => Err(IpcError::AccessDenied),
-				Errno::ENOMSG => Err(IpcError::NoMessage),
-				Errno::EAGAIN => Err(IpcError::QueueFull),
-				Errno::ENOMEM => Err(IpcError::NoMemory),
-				_ => Err(IpcError::UnknownErrorValue(errno())),
-			}
-		}
+	pub fn recv_type<I>(&self, mtype: I) -> Result<Vec<u8>, IpcError> where I: Into<i64> {
+		self.receiver(mtype, 0)
 	}
+
+	/// Receives a message of a type, consuming it.
+	/// This is a non-blocking version of `recv()`
+	/// If no message is to be received, `recv_type()` either blocks or returns
+	/// [`IpcError::NoMemory`]
+	pub fn recv_nonblocking(&self) -> Result<Vec<u8>, IpcError> {
+		self.receiver(0, IpcFlags::NoWait as i32)
+	}
+
+	/// Receives a message of a type, consuming it.
+	/// This is a non-blocking version of `recv_type()`
+	/// If no message is to be received, `recv_type()` either blocks or returns
+	/// [`IpcError::NoMemory`]
+	pub fn recv_type_nonblocking<I>(&self, mtype: I) -> Result<Vec<u8>, IpcError> where I: Into<i64> {
+		self.receiver(mtype, IpcFlags::NoWait as i32)
+	}
+
 }
 
 
@@ -629,7 +587,7 @@ mod tests {
 	#[test]
 	fn send_message() {
 		let queue = MessageQueue::new(MessageQueueKey::IntKey(1234)).init().unwrap();
-		let res = queue.send("kalinka", 25);
+		let res = queue.send("kalinka".as_bytes(), 25);
 		println!("{:?}", res);
 		assert!(res.is_ok());
 	}
