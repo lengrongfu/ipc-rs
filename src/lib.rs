@@ -7,14 +7,10 @@
 
 // TODO implement a queue iterator
 // TODO semaphores, shared memory
-#![feature(associated_type_defaults)]
 #![deny(missing_docs)]
-extern crate serde_cbor;
-extern crate serde;
 extern crate libc;
 extern crate nix;
 
-use serde::{Deserialize, Serialize};
 use nix::errno::errno;
 use nix::errno::Errno;
 
@@ -27,7 +23,6 @@ use libc::{
 use std::ptr;
 //use std::mem;
 use std::convert::From;
-use std::marker::PhantomData;
 use std::borrow::{Borrow, BorrowMut};
 
 pub mod raw;
@@ -103,6 +98,37 @@ pub enum IpcError {
 	/// a value it should never return.
 	/// (for example `msgsnd()` returning 5)
 	UnknownReturnValue(i32),
+}
+
+
+/// A helper struct for creating a message queue
+/// with a path and a project id. This is useful
+/// for creating queues that are accessible by
+/// multiple users.
+#[derive(Debug, Clone)]
+pub struct PathProjectIdKey {
+	path: String,
+	project: i32,
+}
+
+impl PathProjectIdKey {
+	/// Creates a new `MessageQueueKeyWithPathAndProjectId`
+	pub fn new(path: String, project: i32) -> Self {
+		PathProjectIdKey {
+			path,
+			project,
+		}
+	}
+}
+
+/// A helper enum for creating a message queue
+/// with multiple types of keys.
+#[derive(Debug, Clone)]
+pub enum MessageQueueKey {
+	/// A key that is a simple integer
+	IntKey(i32),
+	/// A key that is a path and a project id
+	PathKey(PathProjectIdKey),
 }
 
 /// A helper enum for describing
@@ -195,7 +221,7 @@ impl From<Mode> for i32 {
 /// # Ok(())
 /// # }
 /// ```
-pub struct MessageQueue<T> {
+pub struct MessageQueue {
 	/// The actual ID of the underlying SysV message
 	/// queue. This value is 'unassigned' until a call
 	/// to the `init()` method is made.
@@ -237,7 +263,6 @@ pub struct MessageQueue<T> {
 	pub mode: i32,
 	auto_kill: bool,
 	initialized: bool,
-	types: PhantomData<T>,
 }
 
 /// This struct represents a message that is inserted into
@@ -290,7 +315,7 @@ pub struct Message {
 	pub mtext: [u8; 65536],
 }
 
-impl<T> Drop for MessageQueue<T> {
+impl Drop for MessageQueue {
 	/// Does nothing unless auto_kill is specified,
 	/// in which case it deletes the associated queue
 	fn drop(&mut self) {
@@ -300,7 +325,7 @@ impl<T> Drop for MessageQueue<T> {
 	}
 }
 
-impl<T> MessageQueue<T> {
+impl MessageQueue {
 	/// Allow the creation of a new message queue
 	pub fn create(mut self) -> Self {
 		self.mask |= IpcFlags::CreateKey as i32;
@@ -321,7 +346,7 @@ impl<T> MessageQueue<T> {
 	/// returns [`IpcError::NoMessage`] and similarly,
 	/// when a message can't be sent because the queue is
 	/// full, a nonblocking `send()` returns [`IpcError::QueueFull`]
-	pub fn async(mut self) -> Self {
+	pub fn r#async(mut self) -> Self {
 		self.message_mask |= IpcFlags::NoWait as i32;
 		self
 	}
@@ -367,6 +392,7 @@ impl<T> MessageQueue<T> {
 	/// Initializes a MessageQueue with the key
 	/// `self.key`, proper modes and mask
 	pub fn init(mut self) -> Result<Self, IpcError> {
+
 		self.initialized = true;
 		self.id = unsafe { msgget(self.key, self.mask | self.mode) };
 
@@ -384,27 +410,30 @@ impl<T> MessageQueue<T> {
 	}
 
 	/// Defines a new `MessageQueue`
-	/// In the future, it will be possible to use more types
-	/// of keys (which would be translated to i32 behind the
-	/// scenes automatically)
-	pub fn new(key: i32) -> Self {
+	pub fn new(key: MessageQueueKey) -> Self {
+		let q_key = match key {
+			MessageQueueKey::IntKey(x) => x,
+			MessageQueueKey::PathKey(k) => {
+				unsafe { libc::ftok(k.path.as_ptr() as *const i8, k.project) }
+			}
+		};
+
 		MessageQueue {
 			id: -1,
-			key,
+			key: q_key,
 			mask: 0,
 			message_mask: 0,
 			mode: 0o666,
 			initialized: false,
 			auto_kill: false,
-			types: PhantomData
 		}
 	}
 }
 
-impl<'a, T> MessageQueue<T> where T: Serialize {
+impl MessageQueue {
 	/// Sends a new message, or tries to (in case of non-blocking calls).
 	/// If the queue is full, `IpcError::QueueFull` is returned
-	pub fn send<I>(&self, src: T, mtype: I) -> Result<(), IpcError> where I: Into<i64> {
+	pub fn send<I>(&self, src: &str, mtype: I) -> Result<(), IpcError> where I: Into<i64> {
 		if !self.initialized {
 			return Err(IpcError::QueueIsUninitialized);
 		}
@@ -413,15 +442,17 @@ impl<'a, T> MessageQueue<T> where T: Serialize {
 			mtype: mtype.into(),
 			mtext: [0; 65536],
 		});
-		let bytes = match serde_cbor::ser::to_vec(&src) {
-			Ok(b) => b,
-			Err(_) => return Err(IpcError::FailedToSerialize),
-		};
+
+		let bytes = src.as_bytes();
 
 		bytes
 			.iter()
 			.enumerate()
 			.for_each(|(i, x)| message.mtext[i] = *x);
+
+		for i in 0..bytes.len() {
+			message.mtext[i] = bytes[i];
+		}
 
 		let res = unsafe {
 			msgsnd(self.id, message.borrow() as *const Message, bytes.len(), 0)
@@ -444,12 +475,10 @@ impl<'a, T> MessageQueue<T> where T: Serialize {
 			x => Err(IpcError::UnknownReturnValue(x as i32)),
 		}
 	}
-}
 
-impl<'a, T> MessageQueue<T> where for<'de> T: Deserialize<'de> {
 	/// Returns a message without removing it from the message
-	/// queue. Use `recv()` if you want to consume the message
-	pub fn peek(&self) -> Result<T, IpcError> {
+	/// queue. Use `recv_type()` if you want to consume the message
+	pub fn peek(&self) -> Result<String, IpcError> {
 		if !self.initialized {
 			return Err(IpcError::QueueIsUninitialized);
 		}
@@ -462,10 +491,42 @@ impl<'a, T> MessageQueue<T> where for<'de> T: Deserialize<'de> {
 		let size = unsafe { msgrcv(self.id, message.borrow_mut() as *mut Message, 65536, 0, IpcFlags::MsgCopy as i32 | self.message_mask) };
 
 		if size >= 0 {
-			match serde_cbor::from_slice(&message.mtext[..size as usize]) {
-				Ok(r) => Ok(r),
-				Err(_) => Err(IpcError::FailedToDeserialize),
+			String::from_utf8(message.mtext[..size as usize].to_vec())
+				.map_err(|_| IpcError::FailedToDeserialize)
+		}
+		else {
+			match Errno::from_i32(errno()) {
+				Errno::EFAULT => Err(IpcError::CouldntReadMessage),
+				Errno::EIDRM  => Err(IpcError::QueueWasRemoved),
+				Errno::EINTR  => Err(IpcError::SignalReceived),
+				Errno::EINVAL => Err(IpcError::InvalidMessage),
+				Errno::E2BIG  => Err(IpcError::MessageTooBig),
+				Errno::EACCES => Err(IpcError::AccessDenied),
+				Errno::ENOMSG => Err(IpcError::NoMessage),
+				Errno::EAGAIN => Err(IpcError::QueueFull),
+				Errno::ENOMEM => Err(IpcError::NoMemory),
+				_ => Err(IpcError::UnknownErrorValue(errno())),
 			}
+		}
+	}
+
+	/// Returns a message of given type without removing it from the message
+	/// queue. Use `recv_type()` if you want to consume the message
+	pub fn peek_type<I>(&self, mtype: I) -> Result<String, IpcError> where I: Into<i64> {
+		if !self.initialized {
+			return Err(IpcError::QueueIsUninitialized);
+		}
+
+		let mut message: Box<Message> = Box::new(Message {
+			mtype: mtype.into(),
+			mtext: [0; 65536],
+		});
+
+		let size = unsafe { msgrcv(self.id, message.borrow_mut() as *mut Message, 65536, message.mtype, IpcFlags::MsgCopy as i32 | self.message_mask) };
+
+		if size >= 0 {
+			String::from_utf8(message.mtext[..size as usize].to_vec())
+				.map_err(|_| IpcError::FailedToDeserialize)
 		}
 		else {
 			match Errno::from_i32(errno()) {
@@ -486,7 +547,7 @@ impl<'a, T> MessageQueue<T> where for<'de> T: Deserialize<'de> {
 	/// Receives a message, consuming it. If no message is
 	/// to be received, `recv()` either blocks or returns
 	/// [`IpcError::NoMemory`]
-	pub fn recv(&self) -> Result<T, IpcError> {
+	pub fn recv(&self) -> Result<String, IpcError> {
 		if !self.initialized {
 			return Err(IpcError::QueueIsUninitialized);
 		}
@@ -499,10 +560,44 @@ impl<'a, T> MessageQueue<T> where for<'de> T: Deserialize<'de> {
 		let size = unsafe { msgrcv(self.id, message.borrow_mut() as *mut Message, 65536, 0, self.message_mask) };
 
 		if size >= 0 {
-			match serde_cbor::from_slice(&message.mtext[..size as usize]) {
-				Ok(r) => Ok(r),
-				Err(_) => Err(IpcError::FailedToDeserialize),
+			String::from_utf8(message.mtext[..size as usize].to_vec())
+				.map_err(|_| IpcError::FailedToDeserialize)
+		}
+		else {
+			match Errno::from_i32(errno()) {
+				Errno::EFAULT => Err(IpcError::CouldntReadMessage),
+				Errno::EIDRM  => Err(IpcError::QueueWasRemoved),
+				Errno::EINTR  => Err(IpcError::SignalReceived),
+				Errno::EINVAL => Err(IpcError::InvalidMessage),
+				Errno::E2BIG  => Err(IpcError::MessageTooBig),
+				Errno::EACCES => Err(IpcError::AccessDenied),
+				Errno::ENOMSG => Err(IpcError::NoMessage),
+				Errno::EAGAIN => Err(IpcError::QueueFull),
+				Errno::ENOMEM => Err(IpcError::NoMemory),
+				_ => Err(IpcError::UnknownErrorValue(errno())),
 			}
+		}
+	}
+
+	/// Receives a message of a type, consuming it. 
+	/// If no message is to be received, `recv_type()` either blocks or returns
+	/// either blocks or returns
+	/// [`IpcError::NoMemory`]
+	pub fn recv_type<I>(&self, mtype: I) -> Result<String, IpcError> where I: Into<i64> {
+		if !self.initialized {
+			return Err(IpcError::QueueIsUninitialized);
+		}
+
+		let mut message: Box<Message> = Box::new(Message {
+			mtype: mtype.into(),
+			mtext: [0; 65536],
+		}); // spooky scary stuff
+
+		let size = unsafe { msgrcv(self.id, message.borrow_mut() as *mut Message, 65536, message.mtype, self.message_mask) };
+
+		if size >= 0 {
+			String::from_utf8(message.mtext[..size as usize].to_vec())
+				.map_err(|_| IpcError::FailedToDeserialize)
 		}
 		else {
 			match Errno::from_i32(errno()) {
@@ -521,14 +616,19 @@ impl<'a, T> MessageQueue<T> where for<'de> T: Deserialize<'de> {
 	}
 }
 
+
+
 #[cfg(test)]
 mod tests {
-	use ::MessageQueue;
-	use ::IpcError;
+	use crate::MessageQueue;
+	use crate::IpcError;
+	use crate::MessageQueueKey;
+
+
 
 	#[test]
 	fn send_message() {
-		let queue = MessageQueue::new(1234).init().unwrap();
+		let queue = MessageQueue::new(MessageQueueKey::IntKey(1234)).init().unwrap();
 		let res = queue.send("kalinka", 25);
 		println!("{:?}", res);
 		assert!(res.is_ok());
@@ -536,7 +636,7 @@ mod tests {
 
 	#[test]
 	fn recv_message() {
-		let queue = MessageQueue::<String>::new(1234).init().unwrap();
+		let queue = MessageQueue::new(MessageQueueKey::IntKey(1234)).init().unwrap();
 		let res = queue.recv();
 		println!("{:?}", res);
 		assert!(res.is_ok());
@@ -544,8 +644,8 @@ mod tests {
 
 	#[test]
 	fn nonblocking() {
-		let queue = MessageQueue::<()>::new(745965545)
-			.async()
+		let queue = MessageQueue::new(MessageQueueKey::IntKey(745965545))
+			.r#async()
 			.init()
 			.unwrap();
 

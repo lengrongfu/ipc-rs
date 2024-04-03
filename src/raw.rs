@@ -1,6 +1,6 @@
 //! Module containing raw definitions mapping to the underlying IPC protocol
 
-use Message;
+use crate::Message;
 
 use libc::{
 	size_t,
@@ -19,6 +19,8 @@ use libc::{
 };
 
 use std::os::raw::{c_int, c_long};
+
+
 
 extern "C" {
 	/// Raw `msgsnd()` function; we need to use this declaration as opposed to
