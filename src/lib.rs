@@ -11,6 +11,10 @@
 extern crate libc;
 extern crate nix;
 
+use crossbeam_utils::thread; // Add missing import
+
+use libc::c_int;
+use libc::pthread_kill;
 use nix::errno::errno;
 use nix::errno::Errno;
 
@@ -19,15 +23,23 @@ use libc::{
 	msgctl,
 	msqid_ds,
 };
+use nix::sys::signal;
+use nix::sys::signal::SigAction;
+use nix::sys::signal::SigHandler;
+use nix::sys::signal::Signal::SIGALRM;
 
 use std::fmt;
+use std::os::unix::thread::JoinHandleExt;
 use std::ptr;
 //use std::mem;
 use std::convert::From;
 use std::borrow::{Borrow, BorrowMut};
+use std::time::Duration;
 
 pub mod raw;
 use raw::*;
+
+extern "C" fn empty_signal_handler(_: c_int) {}
 
 /// An enum containing all possible IPC errors
 #[derive(Debug, PartialEq, Eq)]
@@ -482,8 +494,7 @@ impl MessageQueue {
 	}
 
 
-	/// Returns a message of given type without removing it from the message
-	/// queue. Use `recv_type()` if you want to consume the message
+
 	fn receiver<I>(&self, mtype: I, flags: i32) -> Result<Vec<u8>, IpcError> where I: Into<i64> {
 		if !self.initialized {
 			return Err(IpcError::QueueIsUninitialized);
@@ -516,6 +527,35 @@ impl MessageQueue {
 		}
 	}
 
+	
+	fn receiver_timed(&self, mtype: i64, flags: i32, duration: Duration) -> Result<Vec<u8>, IpcError> {
+
+		let ret = thread::scope(|s| {
+		
+			let response: thread::ScopedJoinHandle<Result<Vec<u8>,IpcError>> = s.spawn(move |_| {
+				let sigaction = SigAction::new(SigHandler::Handler(empty_signal_handler), signal::SaFlags::empty(), signal::SigSet::empty());
+				unsafe { signal::sigaction(SIGALRM, &sigaction).map_err(|_| IpcError::UnknownErrorValue(errno()))? };
+				self.receiver(mtype, flags)
+			});
+			
+			let pthread = response.as_pthread_t();
+	
+			s.spawn(move |_| {
+				std::thread::sleep(duration);
+				unsafe { pthread_kill(pthread, libc::SIGALRM ) };
+			});
+
+			response.join()
+		});
+
+		match ret {
+			Ok(Ok(x)) => x,
+			Ok(Err(_)) => Err(IpcError::UnknownErrorValue(errno())),
+			Err(_) => Err(IpcError::UnknownErrorValue(errno())),
+		}
+
+	}
+
 	/// Returns a message without removing it from the message
 	/// queue. Use `recv_type()` if you want to consume the message
 	pub fn peek(&self) -> Result<Vec<u8>, IpcError> {
@@ -540,6 +580,20 @@ impl MessageQueue {
 	/// This is a non-blocking version of `peek_type()`
 	pub fn peek_type_nonblocking<I>(&self, mtype: I) -> Result<Vec<u8>, IpcError> where I: Into<i64> {
 		self.receiver(mtype, IpcFlags::NoWait as i32 | IpcFlags::MsgCopy as i32)
+	}
+
+	/// Returns a message without removing it from the message
+	/// queue. Use `recv_type()` if you want to consume the message
+	/// This is a timed version of `peek()`
+	pub fn peek_timed(&self, duration: Duration) -> Result<Vec<u8>, IpcError> {
+		self.receiver_timed(0, IpcFlags::MsgCopy as i32, duration)
+	}
+
+	/// Returns a message of a given type without removing it from the message
+	/// queue. Use `recv_type()` if you want to consume the message
+	/// This is a timed version of `peek_type()`
+	pub fn peek_type_timed<I>(&self, mtype: I, duration: Duration) -> Result<Vec<u8>, IpcError> where I: Into<i64> {
+		self.receiver_timed(mtype.into(), IpcFlags::MsgCopy as i32, duration)
 	}
 
 	/// Receives a message of a type, consuming it. If no message is
@@ -570,6 +624,24 @@ impl MessageQueue {
 	/// [`IpcError::NoMemory`]
 	pub fn recv_type_nonblocking<I>(&self, mtype: I) -> Result<Vec<u8>, IpcError> where I: Into<i64> {
 		self.receiver(mtype, IpcFlags::NoWait as i32)
+	}
+
+	/// Receives a message of a type, consuming it.
+	/// This is a timed version of `recv()`
+	/// The function will block for the duration of the timeout
+	/// and return [`IpcError::SignalReceived`] if no message is received
+	/// within the given time
+	pub fn recv_timed(&self, duration: Duration) -> Result<Vec<u8>, IpcError> {
+		self.receiver_timed(0, 0, duration)
+	}
+
+	/// Receives a message of a type, consuming it.
+	/// This is a timed version of `recv_type()`
+	/// The function will block for the duration of the timeout
+	/// and return [`IpcError::SignalReceived`] if no message is received
+	/// within the given time
+	pub fn recv_type_timed<I>(&self, mtype: I, duration: Duration) -> Result<Vec<u8>, IpcError> where I: Into<i64> {
+		self.receiver_timed(mtype.into(), 0, duration)
 	}
 
 }
