@@ -15,7 +15,6 @@ use crossbeam_utils::thread; // Add missing import
 
 use libc::c_int;
 use libc::pthread_kill;
-use nix::errno::errno;
 use nix::errno::Errno;
 
 use libc::{
@@ -27,6 +26,7 @@ use nix::sys::signal;
 use nix::sys::signal::SigAction;
 use nix::sys::signal::SigHandler;
 use nix::sys::signal::Signal::SIGALRM;
+use nix::time::ClockNanosleepFlags;
 
 use std::fmt;
 use std::os::unix::thread::JoinHandleExt;
@@ -396,13 +396,13 @@ impl MessageQueue {
 		};
 
 		match res {
-			-1 => match Errno::from_i32(errno()) {
+			-1 => match Errno::last() {
 			    Errno::EPERM  => Err(IpcError::AccessDenied),
 			    Errno::EACCES => Err(IpcError::AccessDenied),
 			    Errno::EFAULT => Err(IpcError::InvalidStruct),
 			    Errno::EINVAL => Err(IpcError::InvalidCommand),
 			    Errno::EIDRM  => Err(IpcError::QueueDoesntExist),
-			    _ => Err(IpcError::UnknownErrorValue(errno())),
+			    _ => Err(IpcError::UnknownErrorValue(Errno::last_raw())),
 			}
 			_ => { self.initialized = false; Ok(()) }
 		}
@@ -416,13 +416,13 @@ impl MessageQueue {
 		self.id = unsafe { msgget(self.key, self.mask | self.mode) };
 
 		match self.id {
-			-1 => match Errno::from_i32(errno()) {
+			-1 => match Errno::last() {
 				Errno::EEXIST => Err(IpcError::QueueAlreadyExists),
 				Errno::ENOENT => Err(IpcError::QueueDoesntExist),
 				Errno::ENOSPC => Err(IpcError::TooManyQueues),
 				Errno::EACCES => Err(IpcError::AccessDenied),
 				Errno::ENOMEM => Err(IpcError::NoMemory),
-				_ => Err(IpcError::UnknownErrorValue(errno())),
+				_ => Err(IpcError::UnknownErrorValue(Errno::last_raw())),
 			}
 			_  => Ok(self),
 		}
@@ -476,7 +476,7 @@ impl MessageQueue {
 		};
 
 		match res {
-			-1 => match Errno::from_i32(errno()) {
+			-1 => match Errno::last() {
 				Errno::EFAULT => Err(IpcError::CouldntReadMessage),
 				Errno::EIDRM  => Err(IpcError::QueueWasRemoved),
 				Errno::EINTR  => Err(IpcError::SignalReceived),
@@ -486,7 +486,7 @@ impl MessageQueue {
 				Errno::ENOMSG => Err(IpcError::NoMessage),
 				Errno::EAGAIN => Err(IpcError::QueueFull),
 				Errno::ENOMEM => Err(IpcError::NoMemory),
-				_ => Err(IpcError::UnknownErrorValue(errno())),
+				_ => Err(IpcError::UnknownErrorValue(Errno::last_raw())),
 			}
 			0 => Ok(()),
 			x => Err(IpcError::UnknownReturnValue(x as i32)),
@@ -512,7 +512,7 @@ impl MessageQueue {
 		}
 
 		else {
-			match Errno::from_i32(errno()) {
+			match Errno::last() {
 				Errno::EFAULT => Err(IpcError::CouldntReadMessage),
 				Errno::EIDRM  => Err(IpcError::QueueWasRemoved),
 				Errno::EINTR  => Err(IpcError::SignalReceived),
@@ -522,7 +522,7 @@ impl MessageQueue {
 				Errno::ENOMSG => Err(IpcError::NoMessage),
 				Errno::EAGAIN => Err(IpcError::QueueFull),
 				Errno::ENOMEM => Err(IpcError::NoMemory),
-				_ => Err(IpcError::UnknownErrorValue(errno())),
+				_ => Err(IpcError::UnknownErrorValue(Errno::last_raw())),
 			}
 		}
 	}
@@ -534,14 +534,15 @@ impl MessageQueue {
 		
 			let response: thread::ScopedJoinHandle<Result<Vec<u8>,IpcError>> = s.spawn(move |_| {
 				let sigaction = SigAction::new(SigHandler::Handler(empty_signal_handler), signal::SaFlags::empty(), signal::SigSet::empty());
-				unsafe { signal::sigaction(SIGALRM, &sigaction).map_err(|_| IpcError::UnknownErrorValue(errno()))? };
+				unsafe { signal::sigaction(SIGALRM, &sigaction).map_err(|_| IpcError::UnknownErrorValue(Errno::last_raw()))? };
 				self.receiver(mtype, flags)
 			});
 			
 			let pthread = response.as_pthread_t();
 	
 			let timer_thread: thread::ScopedJoinHandle<()> = s.spawn(move |_| {
-				nix::unistd::sleep(duration.as_secs() as u32);
+				let time_spec = nix::sys::time::TimeSpec::from_duration(duration);
+				let _ = nix::time::clock_nanosleep(nix::time::ClockId::CLOCK_REALTIME, ClockNanosleepFlags::empty() , &time_spec);
 				unsafe { pthread_kill(pthread, libc::SIGALRM ); };
 			});
 
@@ -553,8 +554,8 @@ impl MessageQueue {
 
 		match ret {
 			Ok(Ok(x)) => x,
-			Ok(Err(_)) => Err(IpcError::UnknownErrorValue(errno())),
-			Err(_) => Err(IpcError::UnknownErrorValue(errno())),
+			Ok(Err(_)) => Err(IpcError::UnknownErrorValue(Errno::last_raw())),
+			Err(_) => Err(IpcError::UnknownErrorValue(Errno::last_raw())),
 		}
 
 	}
