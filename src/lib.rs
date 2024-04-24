@@ -540,12 +540,15 @@ impl MessageQueue {
 			
 			let pthread = response.as_pthread_t();
 	
-			s.spawn(move |_| {
-				std::thread::sleep(duration);
-				unsafe { pthread_kill(pthread, libc::SIGALRM ) };
+			let timer_thread: thread::ScopedJoinHandle<()> = s.spawn(move |_| {
+				nix::unistd::sleep(duration.as_secs() as u32);
+				unsafe { pthread_kill(pthread, libc::SIGALRM ); };
 			});
 
-			response.join()
+			let ret = response.join();
+			let timer_thread_pthread = timer_thread.as_pthread_t();
+			unsafe { pthread_kill(timer_thread_pthread, libc::SIGALRM ); };
+			ret
 		});
 
 		match ret {
@@ -654,6 +657,22 @@ mod tests {
 	use crate::IpcError;
 	use crate::MessageQueueKey;
 
+	#[test]
+	fn test_timed_case1() {
+		let queue = MessageQueue::new(MessageQueueKey::IntKey(1234)).create().init().unwrap();
+		queue.send("kalinka".as_bytes(), 25).unwrap();
+		let res = queue.recv_timed(std::time::Duration::from_secs(5));
+		println!("{:?}", res);
+		assert!(res.is_ok());
+	}
+
+	#[test]
+	fn test_timed_case2() {
+		let queue = MessageQueue::new(MessageQueueKey::IntKey(1234)).create().init().unwrap();
+		let res = queue.recv_timed(std::time::Duration::from_secs(5));
+		println!("{:?}", res);
+		assert!(res.is_err());
+	}
 
 
 	#[test]
