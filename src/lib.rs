@@ -433,7 +433,7 @@ impl MessageQueue {
 		let q_key = match key {
 			MessageQueueKey::IntKey(x) => x,
 			MessageQueueKey::PathKey(k) => {
-				unsafe { libc::ftok(k.path.as_ptr() as *const i8, k.project) }
+				unsafe { libc::ftok(k.path.as_ptr() as *const u8, k.project) }
 			}
 		};
 
